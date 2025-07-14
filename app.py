@@ -1,4 +1,4 @@
-# app.py (为Docker优化后的最终版)
+# app.py (使用英文文件名)
 
 import asyncio, base64, json, logging, os
 from contextlib import asynccontextmanager
@@ -12,15 +12,16 @@ from playwright._impl._errors import TimeoutError as PlaywrightTimeoutError
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 
+# =========================================================
+# === 核心修改：使用纯英文的文件名 ===
+# =========================================================
+SECRET_COOKIE_FILE_PATH = "/etc/secrets/cookie_secret.json"
+
 TARGET_URL = "https://www.life-data.cn/?channel_id=laike_data_first_menu&groupid=1768205901316096"
+# ... 后续代码完全不变 ...
 SCREENSHOT_PATH = "dashboard_screenshot.png"
 DEBUG_SCREENSHOT_PATH = "debug_screenshot.png"
-REFRESH_INTERVAL_SECONDS = 15 # 在云端，把刷新间隔稍微延长一点可能更稳定
-
-# 唯一信源：从环境变量中读取Cookie值
-LIFE_DATA_COOKIE_VALUE = os.getenv("LIFE_DATA_COOKIE")
-
-# ... client, app_state, get_detailed_prompt, etc. 保持不变 ...
+REFRESH_INTERVAL_SECONDS = 15
 client = AsyncOpenAI(
     base_url='https://api-inference.modelscope.cn/v1/',
     api_key='bae85abf-09f0-4ea3-9228-1448e58549fc',
@@ -65,32 +66,32 @@ async def wait_for_data_to_load(page: Page, timeout: int = 60000):
         return False
 
 async def run_playwright_scraper():
-    if not LIFE_DATA_COOKIE_VALUE:
-        app_state["status"] = "致命错误: 未在环境变量中配置 LIFE_DATA_COOKIE。"
-        logging.error(app_state["status"])
-        return
-    
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
+        if not os.path.exists(SECRET_COOKIE_FILE_PATH):
+            app_state["status"] = f"致命错误: 未在路径 {SECRET_COOKIE_FILE_PATH} 找到Secret File。"
+            logging.error(app_state["status"])
+            await browser.close()
+            return
         try:
-            cookie = {"name": "satoken", "value": LIFE_DATA_COOKIE_VALUE, "domain": "www.life-data.cn", "path": "/"}
-            await context.add_cookies([cookie])
-            logging.info("成功从环境变量设置satoken Cookie。")
+            logging.info(f"正在从Secret File '{SECRET_COOKIE_FILE_PATH}' 加载Cookie...")
+            with open(SECRET_COOKIE_FILE_PATH, 'r', encoding='utf-8') as f:
+                await context.add_cookies(json.load(f)['cookies'])
+            logging.info("成功从Secret File设置Cookie。")
         except Exception as e:
-            app_state["status"] = f"设置 Cookie 失败: {e}"; await browser.close(); return
-
+            app_state["status"] = f"从Secret File加载Cookie失败: {e}"
+            await browser.close()
+            return
         page = await context.new_page()
         try:
             logging.info(f"正在导航至: {TARGET_URL}")
             await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=90000)
-            
             if not await wait_for_data_to_load(page, timeout=30000):
                 app_state["status"] = "致命错误: 无法验证目标页面。Cookie可能已失效。"
                 logging.error(app_state["status"])
                 await page.screenshot(path=DEBUG_SCREENSHOT_PATH, full_page=True)
                 await browser.close(); return
-
             logging.info("首次页面验证通过，进入持续刷新循环。")
             while True:
                 try:
@@ -119,7 +120,6 @@ async def run_playwright_scraper():
         finally:
             await browser.close()
 
-# ... FastAPI的lifespan, app, 路由等部分保持不变 ...
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(run_playwright_scraper())
@@ -136,5 +136,5 @@ async def get_debug_screenshot():
     return HTTPException(status_code=404, detail="调试截图不存在。")
 app.mount("/", StaticFiles(directory=".", html=True), name="static")
 if __name__ == "__main__":
-    print("\n" + "="*60 + "\n      🚀 竞潮玩实时数据看板 (Docker模式) 🚀\n" + f"\n      ➡️   http://127.0.0.1:7860\n" + "="*60 + "\n")
+    print("\n" + "="*60 + "\n      🚀 竞潮玩实时数据看板 (Secret File模式) 🚀\n" + f"\n      ➡️   http://127.0.0.1:7860\n" + "="*60 + "\n")
     uvicorn.run(app, host="127.0.0.1", port=7860)
