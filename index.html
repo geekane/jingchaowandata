@@ -48,7 +48,7 @@
             background: linear-gradient(90deg, transparent, var(--accent-color), transparent);
         }
         .header h1 {
-            font-family: 'YouSheBiaoTiHei', 'Exo 2', sans-serif; font-size: 5.3rem; margin: 0; font-weight: normal;
+            font-family: 'YouSheBiaoTiHei', 'Exo 2', sans-serif; font-size: 4.8rem; margin: 0; font-weight: normal;
             background: linear-gradient(90deg, #ffffff, var(--accent-color)); -webkit-background-clip: text; background-clip: text; color: transparent;
             letter-spacing: -1px; position: relative; padding-left: 15px;
         }
@@ -110,31 +110,13 @@
         #store-count-card {
             position: relative; background: var(--card-gradient), linear-gradient(135deg, rgba(0,191,255,0.1), rgba(18,24,34,0.9));
         }
-        
-        /* ========================================================= */
-        /* === 2. 修改CSS：为新的文本格式调整样式 === */
-        /* ========================================================= */
         #store-count-card .value {
-            font-size: 5.5rem; /* 减小字体以适应更长的文本 */
-            line-height: 1.2;
-            padding: 10px 0;
-            display: flex;
-            align-items: baseline; /* 基线对齐，让数字和单位更协调 */
-            justify-content: center;
-            gap: 8px; /* 增加元素间隔 */
-            text-shadow: 0 0 15px rgba(0, 191, 255, 0.5);
+            font-size: 4rem; line-height: 1.2; padding: 10px 0;
+            display: flex; align-items: baseline; justify-content: center;
+            gap: 8px; text-shadow: 0 0 15px rgba(0, 191, 255, 0.5);
         }
-        #store-count-card .value .unit {
-            font-size: 1.5rem; /* 单位的字体大小 */
-            color: var(--text-secondary); /* 单位颜色稍暗，突出数字 */
-            font-weight: 400;
-        }
-        #store-count-card .value .plus {
-            color: var(--accent-color);
-            font-size: 3rem;
-        }
-
-
+        #store-count-card .value .unit { font-size: 1.5rem; color: var(--text-secondary); font-weight: 400; }
+        #store-count-card .value .plus { color: var(--accent-color); font-size: 3rem; }
         #store-count-card::after {
             content: '核心指标'; position: absolute; top: 15px; right: 15px; background: rgba(0,191,255,0.2);
             color: var(--accent-color); font-size: 0.8rem; padding: 3px 10px; border-radius: 20px; font-weight: 500;
@@ -164,13 +146,10 @@
         <div id="metrics-grid" class="metrics-grid">
             <div class="metric-card" data-name="门店数量" id="store-count-card">
                 <div class="name">门店数量</div>
-                <!-- ========================================================= -->
-                <!-- === 1. 修改HTML：直接写入您想要的文本格式 === -->
-                <!-- ========================================================= -->
                 <div class="value">
                     676<span class="unit">连锁</span>
                     <span class="plus">+</span>
-                    72<span class="unit">共管</span>
+                    72<span class="unit">家共管</span>
                 </div>
                 <div class="comparison"></div>
             </div>
@@ -199,7 +178,16 @@
             if (lastKnownData && lastKnownData.metrics) { lastKnownData.metrics.forEach(m => lastDataMap.set(m.name, m)); }
             const currentNames = new Set(currentData.metrics.map(m => m.name)); currentNames.add("门店数量");
             metricsGrid.querySelectorAll('.metric-card').forEach(card => { if (!currentNames.has(card.dataset.name)) { card.remove(); } });
-            
+
+            // =========================================================
+            // === 核心BUG修复区域 ===
+            // =========================================================
+            // 1. 创建一个新的数据对象，用来存储最终要显示在屏幕上的值
+            const dataToStore = {
+                ...currentData,
+                metrics: [] 
+            };
+
             currentData.metrics.forEach(metric => {
                 let card = metricsGrid.querySelector(`.metric-card[data-name="${metric.name}"]`);
                 if (!card) {
@@ -212,17 +200,25 @@
                 const lastMetric = lastDataMap.get(metric.name);
                 const startValue = lastMetric ? parseValue(lastMetric.value) : 0;
                 const newValue = parseValue(metric.value);
-                const endValue = (newValue < startValue) ? startValue : newValue;
+                const endValue = (newValue < startValue && lastMetric) ? startValue : newValue;
                 
                 animateValue(valueEl, startValue, endValue, 1200);
+
+                // 2. 将最终要显示的值（endValue）重新构建成一个metric对象，存入我们新的数据对象中
+                const displayedMetric = { ...metric };
+                const prefix = valueEl.dataset.prefix || '';
+                const isInteger = Number.isInteger(endValue);
+                displayedMetric.value = prefix + (isInteger ? endValue.toLocaleString('en-US') : endValue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+                dataToStore.metrics.push(displayedMetric);
                 
                 const statusClass = metric.status || 'neutral'; const arrow = statusClass === 'up' ? '▲' : '▼';
                 compEl.className = `comparison ${statusClass}`;
                 compEl.innerHTML = metric.comparison && metric.comparison.trim() !== 'N/A' ? `<span>${metric.comparison}</span><span class="arrow">${arrow}</span>` : '';
                 if (statusClass === 'up') { card.classList.add('glowing-up'); } else { card.classList.remove('glowing-up'); }
             });
-            
-            lastKnownData = currentData;
+
+            // 3. 将保存了“屏幕显示值”的新数据对象赋给 lastKnownData
+            lastKnownData = dataToStore;
         }
 
         async function fetchData() {
@@ -234,18 +230,9 @@
             } catch (err) { console.error('Error fetching data:', err); document.getElementById('status-text').textContent = '连接后端失败，请检查服务是否运行。'; }
         }
         
-        // =========================================================
-        // === 3. 修改JavaScript：禁用对门店卡片的动画处理 ===
-        // =========================================================
-        /*
-        由于“门店数量”卡片现在是静态文本，
-        我们不再需要为它运行初始的数字滚动动画。
-        下面的代码已被注释掉或删除。
-        */
+        // 初始动画现在是静态的，所以这段代码不再需要
         // const storeValEl = document.querySelector('#store-count-card .value');
-        // const initCount = parseValue(storeValEl.textContent);
-        // storeValEl.textContent = '';
-        // animateValue(storeValEl, 0, initCount, 1000);
+        // ...
 
         fetchData();
         setInterval(fetchData, REFRESH_INTERVAL_MS);
