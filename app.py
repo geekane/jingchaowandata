@@ -16,7 +16,10 @@ from playwright._impl._errors import TimeoutError as PlaywrightTimeoutError
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 
+# 环境变量优先，如果不存在则退回使用文件（为了本地调试方便）
+COOKIE_VALUE_FROM_ENV = os.getenv("LIFE_DATA_COOKIE")
 COOKIE_FILE = '来客.json'
+
 TARGET_URL = "https://www.life-data.cn/?channel_id=laike_data_first_menu&groupid=1768205901316096"
 SCREENSHOT_PATH = "dashboard_screenshot.png"
 DEBUG_SCREENSHOT_PATH = "debug_screenshot.png"
@@ -26,11 +29,12 @@ client = AsyncOpenAI(
     base_url='https://api-inference.modelscope.cn/v1/',
     api_key='bae85abf-09f0-4ea3-9228-1448e58549fc',
 )
-MODEL_ID = 'Qwen/Qwen2.5-VL-72B-Instruct' 
+MODEL_ID = 'Qwen/Qwen2.5-VL-7B-Instruct' 
 
 app_state = {"latest_data": None, "status": "Initializing..."}
 
 def get_detailed_prompt():
+    # ... 此函数保持不变 ...
     return """
     你是一个专业的数据分析师。请分析这张仪表盘截图，并提取所有关键指标卡片的信息。
     严格按照以下JSON格式返回，不要添加任何额外的解释或Markdown标记。
@@ -42,11 +46,13 @@ def get_detailed_prompt():
     """
 
 def encode_image_to_base64(image_path: str) -> str:
+    # ... 此函数保持不变 ...
     try:
         with open(image_path, "rb") as image_file: return base64.b64encode(image_file.read()).decode('utf-8')
     except FileNotFoundError: return ""
 
 async def analyze_image_with_vlm(image_base64: str) -> dict:
+    # ... 此函数保持不变 ...
     if not image_base64: return {}
     try:
         response = await client.chat.completions.create(
@@ -62,72 +68,79 @@ async def analyze_image_with_vlm(image_base64: str) -> dict:
 
 
 # =========================================================
-# === 1. 新增：智能等待函数 ===
+# === 核心修改：使用最严谨的方式来验证页面 ===
 # =========================================================
 async def wait_for_data_to_load(page: Page, timeout: int = 60000):
     """
-    智能等待，直到页面上的关键数据加载完毕。
-    它会持续检查“成交金额”这个指标，直到它的值不再是 '0' 或 '--'。
+    智能等待，直到页面上出现 "今日实时数据" 这个关键文本。
+    这是判断是否成功进入仪表盘页面的最可靠方法。
     """
-    logging.info("正在智能等待页面数据加载...")
-    # 注意：这里的 'div.index-module_value_392Wk' 是一个CSS选择器，需要根据实际页面元素进行调整。
-    # 这是一个通用的例子，指向一个包含数值的div。
-    # 我们将使用更可靠的JavaScript函数来检查。
+    logging.info("正在严谨验证页面内容，寻找 '今日实时数据'...")
     try:
-        await page.wait_for_function("""
-            () => {
-                // 这个JS函数会在浏览器内部执行
-                // 找到所有指标卡片
-                const cards = document.querySelectorAll('div[class*="index-module_metric-card_"]');
-                if (!cards || cards.length === 0) return false;
-
-                // 检查第一个卡片（通常是成交金额）
-                const firstCardValueElement = cards.querySelector('div[class*="index-module_value_"]');
-                if (!firstCardValueElement) return false;
-
-                const value = firstCardValueElement.innerText.trim();
-                // 如果值不是'0'，也不是'--'，也不是空，就认为加载成功
-                return value !== '0' && value !== '--' && value !== '';
-            }
-        """, timeout=timeout)
-        logging.info("关键数据已加载，页面准备就绪！")
+        # Playwright 的 `page.get_by_text()` 非常强大，它能找到任何包含指定文本的元素。
+        # 我们在这里等待这个元素变得可见。
+        await page.get_by_text("今日实时数据").wait_for(state="visible", timeout=timeout)
+        
+        logging.info("验证成功！已在页面上找到 '今日实时数据'。")
         return True
     except PlaywrightTimeoutError:
-        logging.error(f"智能等待超时（{timeout/1000}秒）：关键数据未能加载。")
+        logging.error(f"验证失败：在 {timeout/1000} 秒内未找到 '今日实时数据' 文本。")
+        return False
+    except Exception as e:
+        logging.error(f"在验证页面时发生未知错误: {e}")
         return False
 
 
 async def run_playwright_scraper():
-    if not os.path.exists(COOKIE_FILE):
-        app_state["status"] = "错误: Cookie 文件未找到。"
-        logging.error(app_state["status"])
-        return
-    
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
+        
+        # 统一的Cookie处理逻辑
         try:
-            with open(COOKIE_FILE, 'r', encoding='utf-8') as f: await context.add_cookies(json.load(f)['cookies'])
-            logging.info("Cookie 加载成功。")
+            if COOKIE_VALUE_FROM_ENV:
+                logging.info("正在使用环境变量中的Cookie...")
+                cookie = {"name": "satoken", "value": COOKIE_VALUE_FROM_ENV, "domain": "www.life-data.cn", "path": "/"}
+                await context.add_cookies([cookie])
+                logging.info("成功设置satoken Cookie。")
+            elif os.path.exists(COOKIE_FILE):
+                logging.info(f"正在使用文件 '{COOKIE_FILE}' 中的Cookie...")
+                with open(COOKIE_FILE, 'r', encoding='utf-8') as f:
+                    await context.add_cookies(json.load(f)['cookies'])
+                logging.info("成功从文件加载Cookie。")
+            else:
+                app_state["status"] = "错误: 未找到任何Cookie配置 (环境变量或文件)。"
+                logging.error(app_state["status"])
+                await browser.close()
+                return
         except Exception as e:
-            app_state["status"] = f"加载 Cookie 失败: {e}"
+            app_state["status"] = f"设置或加载Cookie失败: {e}"
             await browser.close()
             return
 
         page = await context.new_page()
         try:
+            logging.info(f"正在导航至: {TARGET_URL}")
             await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=90000)
             
+            # 在进入主循环前，先进行一次决定性的页面验证
+            if not await wait_for_data_to_load(page, timeout=30000): # 首次验证给30秒时间
+                app_state["status"] = "致命错误: 无法验证目标页面，很可能Cookie已失效或需要重新登录。"
+                logging.error(app_state["status"])
+                await page.screenshot(path=DEBUG_SCREENSHOT_PATH, full_page=True)
+                logging.info(f"致命错误快照已保存至 {DEBUG_SCREENSHOT_PATH}。")
+                await browser.close()
+                return # 直接退出后台任务
+
+            logging.info("首次页面验证通过，进入持续刷新循环。")
+
             while True:
                 try:
                     logging.info("开始新一轮数据刷新...")
                     await page.reload(wait_until="domcontentloaded", timeout=90000)
-
-                    # =========================================================
-                    # === 2. 核心修改：使用智能等待替代固定等待 ===
-                    # =========================================================
+                    
+                    # 每次刷新后都进行验证
                     if await wait_for_data_to_load(page):
-                        # 如果数据成功加载，才进行截图和分析
                         await page.screenshot(path=SCREENSHOT_PATH, full_page=True)
                         image_base64 = encode_image_to_base64(SCREENSHOT_PATH)
                         if image_base64:
@@ -136,31 +149,28 @@ async def run_playwright_scraper():
                                 app_state["latest_data"] = analysis_result
                                 app_state["status"] = f"数据已更新。下一次刷新在 {REFRESH_INTERVAL_SECONDS} 秒后。"
                             else:
-                                app_state["status"] = "AI分析未能从截图中提取有效数据，正在重试..."
+                                app_state["status"] = "AI分析未能提取有效数据。"
                         else:
-                            app_state["status"] = "创建截图失败，正在重试..."
+                            app_state["status"] = "创建截图失败。"
                     else:
-                        # 如果智能等待超时，保存调试截图
-                        app_state["status"] = "目标页面数据加载超时，正在重试..."
+                        app_state["status"] = "页面验证失败，可能已掉线。"
                         await page.screenshot(path=DEBUG_SCREENSHOT_PATH, full_page=True)
-                        logging.info(f"调试截图已保存为 {DEBUG_SCREENSHOT_PATH}。")
 
-                except PlaywrightTimeoutError as e:
-                    logging.error(f"页面刷新(reload)超时，正在保存调试截图...")
-                    await page.screenshot(path=DEBUG_SCREENSHOT_PATH, full_page=True)
-                    app_state["status"] = "目标页面加载超时，正在重试..."
                 except Exception as e:
-                    logging.error(f"后台任务发生未知错误: {e}")
-                    app_state["status"] = "后台任务发生未知错误，正在重试..."
+                    logging.error(f"后台任务循环发生错误: {e}")
+                    app_state["status"] = "后台任务发生错误，正在重试..."
+                    await page.screenshot(path=DEBUG_SCREENSHOT_PATH, full_page=True)
                 
                 await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
 
         except Exception as e:
             app_state["status"] = f"Playwright 任务发生致命错误: {e}"
             logging.error(f"Playwright 任务发生致命错误: {e}", exc_info=True)
+            await page.screenshot(path=DEBUG_SCREENSHOT_PATH, full_page=True)
         finally:
             await browser.close()
 
+# ... FastAPI的lifespan, app, 路由等部分保持不变 ...
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(run_playwright_scraper())
@@ -183,7 +193,7 @@ app.mount("/", StaticFiles(directory=".", html=True), name="static")
 
 if __name__ == "__main__":
     print("\n" + "="*60)
-    print("      🚀 竞潮玩实时数据看板 (智能等待模式) 🚀")
+    print("      🚀 竞潮玩实时数据看板 (严谨验证模式) 🚀")
     print(f"\n      ➡️   http://127.0.0.1:7860")
     print("="*60 + "\n")
     uvicorn.run(app, host="127.0.0.1", port=7860)
