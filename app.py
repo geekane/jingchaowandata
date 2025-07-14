@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse  # === 1. 新增导入 ===
 import uvicorn
 
 from playwright.async_api import async_playwright
@@ -18,13 +19,14 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - 
 COOKIE_FILE = '来客.json'
 TARGET_URL = "https://www.life-data.cn/?channel_id=laike_data_first_menu&groupid=1768205901316096"
 SCREENSHOT_PATH = "dashboard_screenshot.png"
+DEBUG_SCREENSHOT_PATH = "debug_screenshot.png"  # === 2. 定义调试截图路径 ===
 REFRESH_INTERVAL_SECONDS = 10
 
 client = AsyncOpenAI(
     base_url='https://api-inference.modelscope.cn/v1/',
     api_key='bae85abf-09f0-4ea3-9228-1448e58549fc',
 )
-MODEL_ID = 'Qwen/Qwen2.5-VL-72B-Instruct' 
+MODEL_ID = 'Qwen/Qwen2.5-VL-7B-Instruct' 
 
 app_state = {"latest_data": None, "status": "Initializing..."}
 
@@ -78,23 +80,15 @@ async def run_playwright_scraper():
 
         page = await context.new_page()
         try:
-            # 首次导航也使用更宽松的设置
+            logging.info(f"正在导航至: {TARGET_URL}")
             await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=90000)
             
             while True:
                 try:
                     logging.info("开始新一轮数据刷新...")
-                    
-                    # =========================================================
-                    # === 核心修改区域：放宽限制并增加错误处理 ===
-                    # =========================================================
-                    # 1. 增加超时时间到90秒
-                    # 2. 改变等待条件为 'domcontentloaded'
                     await page.reload(wait_until="domcontentloaded", timeout=90000)
-                    
-                    # 等待一小段时间，让页面上的JS有时间执行和渲染
                     await asyncio.sleep(5) 
-
+                    logging.info("页面刷新成功，正在进行常规截图...")
                     await page.screenshot(path=SCREENSHOT_PATH, full_page=True)
                     
                     image_base64 = encode_image_to_base64(SCREENSHOT_PATH)
@@ -109,9 +103,19 @@ async def run_playwright_scraper():
                         app_state["status"] = "创建截图失败，正在重试..."
 
                 except PlaywrightTimeoutError as e:
-                    # 3. 增加循环内错误处理
-                    logging.error(f"页面刷新超时，将在 {REFRESH_INTERVAL_SECONDS} 秒后重试: {e}")
+                    # =========================================================
+                    # === 3. 核心修改：在超时错误时，保存调试截图 ===
+                    # =========================================================
+                    logging.error(f"页面刷新超时！正在保存当前浏览器页面用于调试...")
+                    try:
+                        await page.screenshot(path=DEBUG_SCREENSHOT_PATH, full_page=True)
+                        logging.info(f"调试截图已保存为 {DEBUG_SCREENSHOT_PATH}。您可以通过访问 /debug_screenshot 查看。")
+                    except Exception as screenshot_error:
+                        logging.error(f"保存调试截图失败: {screenshot_error}")
+
                     app_state["status"] = "目标页面加载超时，正在重试..."
+                    logging.error(f"页面刷新超时，将在 {REFRESH_INTERVAL_SECONDS} 秒后重试: {e}")
+                
                 except Exception as e:
                     logging.error(f"后台任务发生未知错误，将在 {REFRESH_INTERVAL_SECONDS} 秒后重试: {e}")
                     app_state["status"] = "后台任务发生未知错误，正在重试..."
@@ -137,11 +141,21 @@ async def get_data():
         raise HTTPException(status_code=404, detail={"status": app_state["status"], "data": None})
     return {"status": app_state["status"], "data": app_state["latest_data"]}
 
+# =========================================================
+# === 4. 新增：用于提供调试截图的API路由 ===
+# =========================================================
+@app.get("/debug_screenshot")
+async def get_debug_screenshot():
+    if os.path.exists(DEBUG_SCREENSHOT_PATH):
+        return FileResponse(DEBUG_SCREENSHOT_PATH)
+    return HTTPException(status_code=404, detail="调试截图不存在，可能尚未发生超时错误。")
+
 app.mount("/", StaticFiles(directory=".", html=True), name="static")
 
 if __name__ == "__main__":
     print("\n" + "="*60)
-    print("      🚀 竞潮玩实时数据看板 🚀")
+    print("      🚀 竞潮玩实时数据看板 (调试模式) 🚀")
     print(f"\n      ➡️   http://127.0.0.1:7860")
+    print(f"      ➡️   当超时发生后，请访问 /debug_screenshot 查看快照")
     print("="*60 + "\n")
     uvicorn.run(app, host="127.0.0.1", port=7860)
