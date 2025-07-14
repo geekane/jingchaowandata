@@ -11,6 +11,7 @@ import uvicorn
 
 from playwright.async_api import async_playwright
 from openai import AsyncOpenAI
+from playwright._impl._errors import TimeoutError as PlaywrightTimeoutError
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 
@@ -40,8 +41,7 @@ def get_detailed_prompt():
 
 def encode_image_to_base64(image_path: str) -> str:
     try:
-        with open(image_path, "rb") as image_file:
-            return base64.b64encode(image_file.read()).decode('utf-8')
+        with open(image_path, "rb") as image_file: return base64.b64encode(image_file.read()).decode('utf-8')
     except FileNotFoundError: return ""
 
 async def analyze_image_with_vlm(image_base64: str) -> dict:
@@ -49,13 +49,7 @@ async def analyze_image_with_vlm(image_base64: str) -> dict:
     try:
         response = await client.chat.completions.create(
             model=MODEL_ID,
-            messages=[{
-                'role': 'user',
-                'content': [
-                    {'type': 'text', 'text': get_detailed_prompt()},
-                    {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{image_base64}'}}
-                ],
-            }]
+            messages=[{'role': 'user', 'content': [{'type': 'text', 'text': get_detailed_prompt()}, {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{image_base64}'}}],}]
         )
         raw_content = response.choices[0].message.content
         if raw_content.startswith("```json"): raw_content = raw_content[7:-3].strip()
@@ -67,38 +61,66 @@ async def analyze_image_with_vlm(image_base64: str) -> dict:
 async def run_playwright_scraper():
     if not os.path.exists(COOKIE_FILE):
         app_state["status"] = f"错误: Cookie 文件 '{COOKIE_FILE}' 未找到。"
+        logging.error(app_state["status"])
         return
+    
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
         try:
             with open(COOKIE_FILE, 'r', encoding='utf-8') as f:
                 await context.add_cookies(json.load(f)['cookies'])
+            logging.info("Cookie 加载成功。")
         except Exception as e:
             app_state["status"] = f"加载 Cookie 失败: {e}"
             await browser.close()
             return
+
         page = await context.new_page()
         try:
-            await page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
+            # 首次导航也使用更宽松的设置
+            await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=90000)
+            
             while True:
-                logging.info("开始新一轮数据刷新...")
-                await page.reload(wait_until="networkidle", timeout=30000)
-                await page.screenshot(path=SCREENSHOT_PATH, full_page=True)
-                image_base64 = encode_image_to_base64(SCREENSHOT_PATH)
-                if image_base64:
-                    analysis_result = await analyze_image_with_vlm(image_base64)
-                    if analysis_result:
-                        app_state["latest_data"] = analysis_result
-                        app_state["status"] = f"数据已更新。下一次刷新在 {REFRESH_INTERVAL_SECONDS} 秒后。"
+                try:
+                    logging.info("开始新一轮数据刷新...")
+                    
+                    # =========================================================
+                    # === 核心修改区域：放宽限制并增加错误处理 ===
+                    # =========================================================
+                    # 1. 增加超时时间到90秒
+                    # 2. 改变等待条件为 'domcontentloaded'
+                    await page.reload(wait_until="domcontentloaded", timeout=90000)
+                    
+                    # 等待一小段时间，让页面上的JS有时间执行和渲染
+                    await asyncio.sleep(5) 
+
+                    await page.screenshot(path=SCREENSHOT_PATH, full_page=True)
+                    
+                    image_base64 = encode_image_to_base64(SCREENSHOT_PATH)
+                    if image_base64:
+                        analysis_result = await analyze_image_with_vlm(image_base64)
+                        if analysis_result:
+                            app_state["latest_data"] = analysis_result
+                            app_state["status"] = f"数据已更新。下一次刷新在 {REFRESH_INTERVAL_SECONDS} 秒后。"
+                        else:
+                            app_state["status"] = "AI分析未能生成有效数据，正在重试..."
                     else:
-                        app_state["status"] = "AI分析未能生成有效数据，正在重试..."
-                else:
-                    app_state["status"] = "创建截图失败，正在重试..."
+                        app_state["status"] = "创建截图失败，正在重试..."
+
+                except PlaywrightTimeoutError as e:
+                    # 3. 增加循环内错误处理
+                    logging.error(f"页面刷新超时，将在 {REFRESH_INTERVAL_SECONDS} 秒后重试: {e}")
+                    app_state["status"] = "目标页面加载超时，正在重试..."
+                except Exception as e:
+                    logging.error(f"后台任务发生未知错误，将在 {REFRESH_INTERVAL_SECONDS} 秒后重试: {e}")
+                    app_state["status"] = "后台任务发生未知错误，正在重试..."
+                
                 await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
+
         except Exception as e:
-            app_state["status"] = f"主循环发生严重错误: {e}"
-            logging.error(f"主循环异常: {e}", exc_info=True)
+            app_state["status"] = f"Playwright 任务发生致命错误: {e}"
+            logging.error(f"Playwright 任务发生致命错误，任务已终止: {e}", exc_info=True)
         finally:
             await browser.close()
 
